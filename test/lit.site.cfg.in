@@ -1,0 +1,6 @@
+# Auto-generated, do not edit
+config.kleebmc_bin = "@KLEEBMC_BIN@"
+config.filecheck_tool = "@FILECHECK_TOOL@"
+
+# load main config
+lit_config.load_config(config, "@KLEEBMC_SOURCE_DIR@/test/lit.cfg")

@@ -1,0 +1,12 @@
+name: PR
+
+on: [pull_request]
+
+jobs:
+  build-ubuntu:
+    name: build-ubuntu
+    uses: ./.github/workflows/build_ubuntu.yml
+    with:
+      operating-system: ubuntu-latest
+      build-flags: '--llvm-dir=/usr/lib/llvm-14'
+      enable-test: true

@@ -1,0 +1,468 @@
+#!/usr/bin/env python3
+import signal
+import sys
+import os
+import re
+import tempfile
+import subprocess
+from time import time
+import logging
+import argparse
+from typing import List
+from ktest_parser import ktest_to_bytes
+from acsl_rewriter import process_acsl
+
+# TODO: generate version string from git
+__version__ = "0.1.0"
+
+logger = logging.getLogger(__name__)
+args = {}
+env = os.environ.copy()
+
+GREY = "\x1b[37;20m"
+YELLOW = "\x1b[33;20m"
+RED = "\x1b[31;20m"
+BOLD_RED = "\x1b[31;1m"
+RESET = "\x1b[0m"
+
+BIN_FOLDER = os.path.dirname(os.path.realpath(__file__))
+PREFIX = os.path.dirname(BIN_FOLDER)
+INCLUDE_DIR = os.path.join(PREFIX, 'include')
+LLVM_PREFIX = os.path.join(PREFIX, f'llvm')
+
+BASE_KLEE_ARGS = ['--strip-unwanted-calls', '--external-calls=all', '-use-forked-solver=false',
+                  '--libc=uclibc', '--write-ktests=true', '--use-sym-size-alloc=true', '--cex-cache-validity-cores',
+                  '--dump-states-on-halt=none', '--output-stats=true', '--output-istats=true', '--use-call-paths=false',
+                  '--optimize=false', '--silent-klee-assume=1', '--allocate-determ', '--allocate-determ-size=4000',
+                  '--allocate-determ-start-address=0x00030000000', '--output-source=false']
+
+class ColorFormatter(logging.Formatter):
+  """
+  Add colors to messages.
+  """
+  FORMAT = "%(levelname)s - %(message)s"
+
+  FORMATS = {
+    logging.DEBUG: GREY + FORMAT + RESET,
+    logging.INFO: GREY + FORMAT + RESET,
+    logging.WARNING: YELLOW + FORMAT + RESET,
+    logging.ERROR: RED + FORMAT + RESET,
+    logging.CRITICAL: BOLD_RED + FORMAT + RESET
+  }
+
+  def format(self, record):
+    log_fmt = self.FORMATS.get(record.levelno)
+    formatter = logging.Formatter(log_fmt)
+    return formatter.format(record)
+
+
+def setup_logger():
+  if args.verbose:
+    level = logging.DEBUG
+  else:
+    level = logging.INFO
+  logger.setLevel(level)
+
+  stdout_handler = logging.StreamHandler(sys.stdout)
+  stdout_handler.setLevel(logging.DEBUG)
+  stdout_handler.setFormatter(ColorFormatter())
+  logger.addHandler(stdout_handler)
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Command-line argument parser")
+
+    parser.add_argument('-V', '--version', action='version',
+                        version=f'%(prog)s {__version__}', help="Show version information")
+
+    parser.add_argument('-v', '--verbose', action='store_true', help="Enable debug output")
+    parser.add_argument('-o', '--output', type=str, help='File in which to write testcase input')
+
+    parser.add_argument('--32', action='store_true', dest='is32bit', default=False,
+                        help="Enable 32-bit environment")
+    parser.add_argument('--se-timeout', type=int, default=30,
+                        help="Set timeout for symbolic execution with local search (seconds)")
+    parser.add_argument('--clam-timeout', type=int, default=1,
+                        help="Set timeout for clam (seconds)")
+    parser.add_argument('--max-memory', type=int, default=4096,
+                        help="Set maximum memory size (MB)")
+    parser.add_argument('--ls-timeout', type=int, default=5,
+                        help="Set timeout for local search attempt (seconds)")
+    # parser.add_argument('-s', '--slice', action='store_true', help="Enable unsound static slicer")
+
+
+    # Hidden argument that allows to set the working directory (default: temporary directory)
+    parser.add_argument('-w', '--workdir', type=str, default=None, help=argparse.SUPPRESS)
+
+    parser.add_argument('files', metavar='FILE', nargs='+', type=str, help="C source files")
+
+    _args, unknowns = parser.parse_known_args()
+    _args.files = list(map(os.path.abspath, _args.files))
+    return _args, unknowns
+
+
+def setup_environment():
+  env['PATH'] = os.path.pathsep.join([os.path.join(PREFIX, 'bin'), os.path.join(LLVM_PREFIX, 'bin'), env.get('PATH', '')])
+  ld_lib_path = [os.path.join(LLVM_PREFIX, 'lib')]
+  if args.is32bit:
+    ld_lib_path.append(os.path.join(LLVM_PREFIX, 'lib32'))
+  env['LD_LIBRARY_PATH'] = os.path.pathsep.join(ld_lib_path + [env.get('LD_LIBRARY_PATH', '')])
+  env['C_INCLUDE_DIR'] = os.path.pathsep.join([INCLUDE_DIR, env.get('C_INCLUDE_DIR', '')])
+  klee_lib_path = os.path.join(LLVM_PREFIX, 'lib32' if args.is32bit else 'lib')
+  env['KLEE_RUNTIME_LIBRARY_PATH'] = os.path.join(klee_lib_path, 'klee', 'runtime')
+
+  env['AFL_BENCH_UNTIL_CRASH'] = '1' # exit soon after a crash is found
+  env['AFL_SKIP_CPUFREQ'] = '1' # HACK: skip afl-fuzz's cpu frequency check
+  env['AFL_CRASH_EXITCODE'] = '100' # sets the exit code AFL treats as crash.
+
+  if args.workdir:
+    workdir = args.workdir
+  else:
+    workdir = tempfile.mkdtemp(prefix="kleebmc_")
+    args.workdir = workdir
+  os.chdir(workdir)
+
+
+def run_command(cmd : List[str]) -> subprocess.CompletedProcess:
+  """Run a shell command, throws subprocess.CalledProcessError if the return code is not 0."""
+  logger.info('Executing: %s', ' '.join(cmd))
+  try:
+    pipe = subprocess.Popen(cmd, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+    stdout = b''
+    stderr = b''
+    for line in pipe.stdout:
+      stdout += line
+    for line in pipe.stderr:
+      logger.debug(line.rstrip().decode())
+      stderr += line
+
+    returncode = pipe.wait()
+    if returncode != 0:
+      raise subprocess.CalledProcessError(returncode, cmd, stdout, stderr)
+  except KeyboardInterrupt:
+    logger.info("\nInterrupted! Terminating subprocess...")
+    try:
+      # kill the entire process group
+      os.killpg(os.getpgid(pipe.pid), signal.SIGTERM)
+    except ProcessLookupError:
+      pass  # Process already terminated
+    raise
+
+  return subprocess.CompletedProcess(cmd, returncode, stdout, stderr)
+
+
+def link_undefs(file):
+  def get_path(undef):
+    if args.is32bit:
+      return os.path.abspath(f'{LLVM_PREFIX}/lib32/verifier/klee/{undef}.bc')
+    else:
+      return os.path.abspath(f'{LLVM_PREFIX}/lib/verifier/klee/{undef}.bc')
+
+  def get_undefs(source):
+    output = run_command([
+      'llvm-nm-14', '--undefined-only', '-j', source
+    ]).stdout.decode().splitlines()
+    return [s.strip() for s in output]
+
+  flag = True
+  while flag:
+    flag = False
+
+    # find our models of undefined functions and store their paths to a list
+    libs = []
+    for undef in get_undefs(file):
+      logger.info('Trying to link external function call: %s', undef)
+      path = get_path(undef)
+      if os.path.isfile(path):
+        libs.append(path)
+
+    if libs:
+      flag = True
+      libs.append(file)
+      run_llvm_link(file, libs)
+
+
+def run_llvm_link(file, libs):
+  run_command(['llvm-link-14', '-o', 'temp.bc'] + libs)
+  run_command(['mv', 'temp.bc', file])
+
+
+def run_llvm_opt(input, output, args):
+  run_command([
+    'opt-14', '-load', 'libKleeBMCPasses.so', input, '-o', output,
+    *args, '-enable-new-pm=0'
+  ])
+
+def print_env_info():
+    """Print environment information for debugging."""
+    logger.info("Environment configuration:")
+    logger.info("PREFIX=%s", PREFIX)
+    logger.info("LLVM_PREFIX=%s", LLVM_PREFIX)
+    logger.info("PATH=%s", env['PATH'])
+    logger.info("LD_LIBRARY_PATH=%s", env['LD_LIBRARY_PATH'])
+    logger.info("C_INCLUDE_DIR=%s", env['C_INCLUDE_DIR'])
+    logger.info("KLEE_RUNTIME_LIBRARY_PATH=%s", env['KLEE_RUNTIME_LIBRARY_PATH'])
+
+def run():
+  # 1. Compile
+  bcs = []
+  for file in args.files:
+    # Copy the file to the working directory, so we can modify it.
+    run_command(['cp', file, os.path.basename(file)])
+    file = os.path.basename(file)
+    process_acsl(file)
+
+    out = os.path.splitext(os.path.basename(file))[0] + '.bc'
+    # TODO: If we turn on -O2, some error paths will be opt-14imized, this needs more investigation.
+    run_command(
+      ['clang-14', '-c', '-emit-llvm', '-fbracket-depth=2048', '-fgnu89-inline', '-D__inline=',
+        '-Wno-unused-parameter', '-Wno-unknown-attributes', '-Wno-unused-label',
+        '-Wno-unknown-pragmas', '-Wno-unused-command-line-argument',
+        '-O0', '-g', '-disable-O0-opt-none', '-disable-llvm-passes', f'-I{INCLUDE_DIR}'] +
+      (['-m32'] if args.is32bit else []) +
+      ['-fno-discard-value-names', '-o', out, file]
+    )
+    bcs.append(out)
+
+  run_command(['llvm-link-14', '-o', 'code.bc'] + bcs)
+
+  # 2. Run static analyses
+  run_llvm_opt('code.bc', 'code.pre.bc', [
+    '-replace-reach-error', '-remove-infinite-loops'
+  ])
+  run_llvm_opt('code.pre.bc', 'code.pre.bc', [
+    '-O3', '-remove-infinite-loops', '-mem2reg', '-break-crit-loops', '-lowerswitch'
+  ])
+
+  # TODO: sbt-slicer is unsound, needs investigation
+  # if args.slice:
+  #   try:
+  #     source_not_linked = 'code.pre.sliced.bc'
+  #     run_command([
+  #       'sbt-slicer', '-c', '__assert_fail,__VERIFIER_error',
+  #       '--preserved-functions', '__assert_fail,__VERIFIER_error',
+  #       '-o', source, '-pta', 'fi', 'code.pre.bc'
+  #     ])
+  #   except subprocess.CalledProcessError as e:
+  #     logger.debug('Slicer exited with code %d, using unsliced file.', e.returncode)
+  #     source_not_linked = 'code.pre.bc'
+
+  source_not_linked = 'code.pre.bc'
+
+  # Link our models of undefined functions recursively
+  source = 'code.klee.bc'
+  run_command(['cp', source_not_linked, source])
+  link_undefs(source)
+
+  # 3. Verification
+  # 3.1 K-induction over-approximation
+  try:
+    os.mkdir('clam')
+  except FileExistsError:
+    pass
+  try:
+    run_command([
+      'timeout', '-k', '1', f'{args.ls_timeout * .2}',
+      'clam.py', f'-m{32 if args.is32bit else 64}', '--crab-opt=add-invariants',
+      '--crab-opt-invariants-loc=loop-header', '--crab-dom=int', '--crab-lower-unsigned-icmp',
+      '--crab-widening-delay=32', '--turn-undef-nondet', '--crab-inter', '--crab-inter-recursive-functions',
+      '--devirt-functions=sea-dsa', '--temp-dir=clam', '--save-temps',
+      '--log=%s' % ('debug' if args.verbose else 'warning'),
+      source, '-o', 'code.inv.bc'
+    ])
+  except subprocess.CalledProcessError as e:
+    logger.debug(e.stderr.decode())
+    logger.warning('Clam failed or exceeded time limit.')
+    return do_symex(source)
+
+  run_llvm_opt('code.inv.bc', 'code.kind.bc', ['-k-induction', '-kind-k=4', '-rename-clam-assume', '-simplifycfg'])
+  # Link again on the transformed bitcode
+  link_undefs('code.kind.bc')
+  try:
+    output = run_command(
+      ['timeout', '-k', '1', f'{args.ls_timeout * .6}',
+       'klee', *BASE_KLEE_ARGS, '-exit-on-error-type=Assert',
+       f'--max-memory={args.max_memory}', f'-max-time={args.ls_timeout * .6}', 'code.kind.bc']
+    ).stderr.decode().splitlines()
+  except subprocess.CalledProcessError as e:
+    if e.returncode == 124 or (b'ctrl-c detected' in e.stderr): # timeout
+      logger.warning('KLEE exceeded time limit.')
+      return do_symex(source)
+    raise
+
+  # If the upper-approximation is sound, the original program must be safe. But we can't afford to do a sound
+  # abstraction because it needs to track memory and function calls precisely which is too costly.
+  # if not any('ASSERTION FAIL:' in line for line in output):
+  #   return ('true', None)
+
+  # Otherwise, parse all error tests klee generated.
+  os.makedirs('corpus', exist_ok=True)
+  has_seeds = False
+  for filename in os.listdir('klee-last'):
+    if filename.endswith('.assert.err'):
+      has_seeds = True
+      ktest_file = os.path.join('klee-last', filename.split('.')[0] + '.ktest')
+      input_bytes = ktest_to_bytes(ktest_file)
+      # If the program crashes with no input at all, we still need to write one byte for afl
+      # to use the seed.
+      if len(input_bytes) == 0:
+        input_bytes = bytes(1)
+      with open(os.path.join('corpus', filename), 'wb') as f:
+        f.write(input_bytes)
+
+  # 3.2 Fuzzing
+  if has_seeds:
+    run_llvm_opt(source_not_linked, 'code.tofuzz.bc', ['-map2check'])
+    run_llvm_link('code.tofuzz.bc', [
+      f'{LLVM_PREFIX}/{"lib32" if args.is32bit else "lib"}/verifier/klee/FuzzerRuntime.bc',
+      'code.tofuzz.bc'
+    ])
+    link_undefs('code.tofuzz.bc')
+    run_command([
+      os.path.join(LLVM_PREFIX, 'bin', 'afl-clang-lto'), '-g', '-m32' if args.is32bit else '',
+      'code.tofuzz.bc', '-o', 'fuzzer'
+    ])
+    try:
+      output = run_command([
+          'timeout', '-k', '1', f'{args.ls_timeout * .2}', os.path.join(LLVM_PREFIX, 'bin', 'afl-fuzz'),
+          '-m', f'{args.max_memory}',
+          '-i', os.path.abspath('corpus'), '-o', 'afl-out', '--', os.path.abspath('fuzzer'), '@@'
+      ]).stdout.decode().splitlines()
+
+      if any('Testing aborted programmatically' in line for line in output):
+        # Unfortunately, even if we added signal handlers in FuzzerRuntime to avoid crashing the program on
+        # memory errors, this does not prevent inputs that may cause stack overflow from crashing the program (like
+        # allocating an extremely large array on the stack). So we need to double-check.
+        test_cases_dir = os.path.join('afl-out', 'default', 'crashes')
+        for file in os.listdir(test_cases_dir):
+          if file.startswith('README'): continue
+          try:
+            run_command(['./fuzzer', os.path.join(test_cases_dir, file)])
+          except subprocess.CalledProcessError as e:
+            for line in e.output.splitlines():
+              if b"__assert_fail() called" in line:
+                with open(os.path.join(test_cases_dir, file), 'rb') as f:
+                  testcase = f.read()
+                return ('false(unreach-call, local search)', testcase)
+
+    except subprocess.CalledProcessError as e:
+      for line in e.stdout.decode().splitlines():
+        match = re.search(r"orig:(.*?)' results in a crash", line)
+        if match is not None:
+          with open(os.path.join('corpus', match.group(1)), 'rb') as f:
+            testcase = f.read()
+          return ('false(unreach-call, local search)', testcase)
+      if e.returncode == 124:
+        logger.warning('AFL exceeded time limit.')
+      else: logger.warning("AFL exited with code %d!", e.returncode)
+
+  return do_symex(source)
+
+def do_symex(source):
+  try:
+    output = run_command(
+      ['timeout', '-k', '1', f'{args.se_timeout}',
+       'klee', *BASE_KLEE_ARGS, '-exit-on-error-type=Assert',
+       f'--max-memory={args.max_memory}', f'-max-time={args.se_timeout}', source]
+    ).stderr.decode().splitlines()
+  except subprocess.CalledProcessError as e:
+    if e.returncode == 124 or (b'ctrl-c detected' in e.stderr): # timeout
+      logger.warning('KLEE exceeded time limit.')
+      return ('unknown', None)
+    else:
+      logger.debug(e.stderr.decode())
+      raise
+
+  if any('ASSERTION FAIL:' in line for line in output):
+    # Make sure klee can reproduce the error
+    # FIXME: Sometimes klee reports 'replay size mismatch' error and gives up
+    ktest_dir = os.path.realpath('klee-last')
+    for file in os.listdir(ktest_dir):
+      if file.endswith('.assert.err'):
+        ktest_file = os.path.join(ktest_dir, file.split('.')[0] + '.ktest')
+        try:
+          output = run_command([
+            'timeout', '-k', '1', f'{args.se_timeout}',
+            'klee', *BASE_KLEE_ARGS, '-exit-on-error-type=Assert', f'--replay-ktest-file={ktest_file}',
+            f'--max-memory={args.max_memory}', f'-max-time={args.se_timeout}', source
+          ]).stderr.decode().splitlines()
+
+          if any('ASSERTION FAIL:' in line for line in output): # success
+            testcase = ktest_to_bytes(ktest_file)
+            return ('false(unreach-call)', testcase)
+        except subprocess.CalledProcessError as e:
+          if e.returncode == 124 or (b'ctrl-c detected' in e.stderr):
+            logger.warning('KLEE exceeds time limit while replaying error input.')
+            return ('unknown(replay failed)', None)
+          raise
+
+    return ('unknown(replay failed)', None) # Can't reproduce :(
+
+  elif any('HaltTimer invoked' in line for line in output):
+    return ('unknown', None)
+
+  return ('true', None)
+
+def check_environment():
+  """perform necessary system checks"""
+  if os.name == 'posix':
+    # check crash handling
+    with open("/proc/sys/kernel/core_pattern", "r") as f:
+      if f.read(1) == '|':
+        logger.error('Your system is configured to send core dump notifications to an\n'
+        'external utility. To avoid having crashes misinterpreted as timeouts, \n'
+        'please temporarily modify /proc/sys/kernel/core_pattern, like so:\n'
+        '    echo core | sudo tee /proc/sys/kernel/core_pattern')
+        sys.exit(1)
+
+    #check CPU scaling governor
+    # with open('/sys/devices/system/cpu/cpu0/cpufreq/scaling_min_freq', 'r') as f:
+    #   min_freq = int(f.read().split()[0])
+    # with open('/sys/devices/system/cpu/cpu0/cpufreq/scaling_max_freq', 'r') as f:
+    #   max_freq = int(f.read().split()[0])
+    # if min_freq != max_freq:
+    #   logger.error('Whoops, your system uses on-demand CPU frequency scaling, adjusted\n'
+    #               f'    between {min_freq} and {max_freq} MHz. Unfortunately, the scaling algorithm in the\n'
+    #                '    kernel is imperfect and can miss the short-lived processes spawned.\n'
+    #                'To keep things moving, please run these commands:\n\n'
+    #                '    cd /sys/devices/system/cpu\n'
+    #                '    echo performance | sudo tee cpu*/cpufreq/scaling_governor\n\n')
+    #   sys.exit(1)
+
+def main():
+  global args
+  tic = time()
+
+  args, unknowns = parse_args()
+  setup_logger()
+  if unknowns:
+    logger.warning('Ignored arguments: %s', format(unknowns))
+
+  if args.output:
+    output = os.path.join(os.getcwd(), args.output)
+
+  check_environment()
+  setup_environment()
+  print_env_info()
+
+  try:
+    ret = 0
+    result, testcase = run()
+    if testcase and args.output:
+      with open(output, 'wb') as f:
+        logger.info(f'Writing error input to {output}.')
+        f.write(testcase)
+  except subprocess.CalledProcessError as e:
+    ret = 1
+    result = 'error'
+    logger.error('Command %s exited with code %s', e.cmd, e.returncode)
+
+  logger.info(f'Verification finished with result {result}.')
+
+  logger.info('Time elapsed: %ss', format(time() - tic))
+  sys.exit(ret)
+
+
+if __name__ == "__main__":
+  main()

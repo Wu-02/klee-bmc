@@ -1,0 +1,38 @@
+on:
+  workflow_dispatch:
+    inputs:
+      enable-test:
+        description: "run tests for this build"
+        required: true
+        type: boolean
+
+jobs:
+  build:
+    name: Build KLEE-BMC (ubuntu)
+    runs-on: ubuntu-22.04
+    steps:
+    - uses: actions/checkout@v4
+    - name: Install dependencies
+      run: |
+        wget https://apt.llvm.org/llvm.sh && chmod +x llvm.sh && sudo ./llvm.sh 14
+        sudo apt-get install -y curl rsync make cmake unzip gcc-multilib xz-utils zlib1g-dev \
+          git build-essential ninja-build pkg-config m4 zlib1g-dev libsqlite3-dev \
+          libboost-all-dev libgmp-dev pip
+        sudo apt-get download libpolly-14-dev && sudo dpkg --force-all -i libpolly-14-dev*
+        sudo pip install meson lit
+    - name: Build KLEE-BMC
+      run: |
+        ./build.sh --targets=all --llvm-dir=/usr/lib/llvm-14
+    - uses: actions/upload-artifact@v4
+      with:
+        name: release-ubuntu
+        path: ./Release
+    - name: debug test failure
+      run: |
+        echo core | sudo tee /proc/sys/kernel/core_pattern && \
+        ./Release/bin/klee-bmc -v ./test/Core/array.c
+    - name: Run tests
+      if: ${{ inputs.enable-test == true }}
+      run: |
+        echo core | sudo tee /proc/sys/kernel/core_pattern && \
+        cd build-14.0.6-Release && lit -v test/Core test/ACSL
